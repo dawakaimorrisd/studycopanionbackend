@@ -1,0 +1,51 @@
+{
+	"name": "study-companion",
+	"private": true,
+	"version": "0.0.1",
+	"type": "module",
+	"scripts": {
+		"dev": "vite dev",
+		"build": "prisma generate && vite build",
+		"preview": "vite preview",
+		"prepare": "svelte-kit sync || echo ''",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"db:local:generate": "DB_PROVIDER=sqlite node scripts/set-db-provider.mjs && prisma generate",
+		"db:local:migrate": "DB_PROVIDER=sqlite node scripts/set-db-provider.mjs && prisma migrate dev",
+		"db:local:studio": "DB_PROVIDER=sqlite node scripts/set-db-provider.mjs && prisma studio",
+		"db:production:generate": "DB_PROVIDER=postgresql node scripts/set-db-provider.mjs && prisma generate",
+		"db:production:migrate": "DB_PROVIDER=postgresql node scripts/set-db-provider.mjs && prisma migrate deploy",
+		"seed": "tsx prisma/seed.ts",
+		"seed:demo": "tsx prisma/seedDemo.ts"
+	},
+	"prisma": {
+		"seed": "tsx prisma/seed.ts"
+	},
+	"devDependencies": {
+		"@prisma/client": "^5.22.0",
+		"@sveltejs/adapter-auto": "^7.0.1",
+		"@sveltejs/adapter-netlify": "^6.0.4",
+		"@sveltejs/kit": "^2.63.0",
+		"@sveltejs/vite-plugin-svelte": "^7.1.2",
+		"@tailwindcss/vite": "^4.3.3",
+		"@types/node": "^26.4.0",
+		"@types/pdf-parse": "^1.1.5",
+		"@vite-pwa/sveltekit": "^1.1.0",
+		"prisma": "^5.22.0",
+		"svelte": "^5.56.1",
+		"svelte-check": "^4.6.0",
+		"tailwindcss": "^4.3.3",
+		"tsx": "^4.23.12",
+		"typescript": "^6.0.3",
+		"vite": "^8.0.16"
+	},
+	"dependencies": {
+		"argon2": "^0.45.1",
+		"better-sqlite3": "^13.0.3",
+		"cloudinary": "^2.11.0",
+		"mammoth": "^1.12.1",
+		"pdf-lib": "^1.17.1",
+		"pdf-parse": "^1.1.4",
+		"zod": "^4.4.3"
+	}
+}

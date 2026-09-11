@@ -1,0 +1,901 @@
+// schema.prisma — Study Companion Backend (owns the DB + its own console + the API)
+//
+// v10 — Phase 10+ rebuild. Base: the actual v9 schema (synchronous generation,
+// multiple-choice QuestionUnit, dual-provider String "enums", no @db.Decimal).
+// On top of that base, this adds the new academic/monetization/assignment
+// architecture from the Phase 10+ plan:
+//
+//   - Semester is now the top-level academic container. Exactly one Semester
+//     should be isActive at a time (enforced in the service layer, not the DB).
+//   - Students no longer get content just by belonging to a College. They are
+//     enrolled per semester (StudentSemester) into specific courses
+//     (StudentCourse), assigned only by Admin/Moderator from the console.
+//   - Instructor↔Course assignment (InstructorCourse) is now semester-scoped
+//     too — an instructor can teach different courses in different semesters.
+//   - Paid access is semester-specific for both students and instructors
+//     (StudentSemesterAccess / InstructorSemesterAccess) — never a permanent
+//     flag on the person. AccessPayment is a lightweight, append-only manual
+//     payment history; it does not replace the access row, which is the live
+//     current state. Payment intentionally never rolls over between
+//     semesters; course enrollment does (copied forward as a starting point,
+//     editable by Admin/Moderator).
+//   - NoteAccess/AssignmentAccess (the old "staff manually grants each
+//     student each note" model) are REMOVED as the access mechanism.
+//     Visibility is now computed: paid semester access + enrolled in the
+//     course + content published + content belongs to the same semester =
+//     visible. No per-student grant rows. See lib/server/access/*.ts
+//     (canAccessCourse, canAccessNote, etc.) — the API must enforce this
+//     server-side on every content/assignment/distribution endpoint; the
+//     frontend is never trusted for it.
+//   - Course content gains real structure: CourseChapter, and Note now hangs
+//     off a chapter (optional — a chapter-less note is still valid) instead
+//     of just a flat chapterLabel string. Note/Assignment are both now
+//     semester-scoped (semesterId) so old content never leaks into a new
+//     semester's eligible set.
+//   - Note publication is a separate step from generation ("Save for
+//     Students"): publishedAt/publishedByStaffId. A generated-but-unpublished
+//     note is invisible to students even if they'd otherwise be eligible.
+//     Assignment does NOT have this — see the note below; there is no
+//     staff publication step for Assignment at all anymore.
+//   - REDESIGNED, post-launch, per direct repeated product clarification:
+//     Assignment is NOT a staff-created task — "the app is the hub for
+//     [students] to submit; that flow belongs to student." The prompt
+//     itself is given in class, outside this app. There is no separate
+//     staff-authored prompt entity — a student creates the Assignment
+//     record themselves by uploading their homework, choosing INDIVIDUAL
+//     or GROUP at that moment (not set by staff in advance). This
+//     collapsed what was originally two models (a staff-created
+//     `Assignment` + a student-created `AssignmentSubmission` pointing at
+//     it) into the single `Assignment` model below.
+//     `AssignmentMember` is the FIRST tagging flow — who's in the group,
+//     visible to whoever manages the course. `AssignmentDistribution` /
+//     `AssignmentDistributionRecipient` is the SECOND, unrelated flow — the
+//     group head sending their own assignment's generated study material
+//     to other eligible (paid + enrolled + same semester) classmates.
+//     These are deliberately separate tables/actions, never conflated as
+//     "tagging." Instructor/Admin/Moderator have READ-ONLY access to
+//     Assignments — they see what's submitted for their course, full stop.
+//   - QuestionUnit's sourceType has two values, NOTE and ASSIGNMENT — a
+//     third, ASSIGNMENT_SUBMISSION, briefly existed while Assignment and
+//     submission were separate entities and was removed when they merged.
+//     A GROUP assignment's own submitter can generate MCQ drills from
+//     their own submitted work, reusing the exact same synchronous
+//     generation pipeline as Note (Groq call inline on the "Generate"
+//     action, error recorded on generationError, no job table — unchanged
+//     from v9).
+//   - StudySession gains semesterId/courseId/chapterId so analytics
+//     (most/least studied course or chapter, weekly totals, engagement
+//     percentages) don't need deep joins. Start/End Study remains the
+//     authoritative session boundary; scrolling/activity is not.
+//   - Money is stored as Int cents (amountPaidCents), not Decimal — Prisma's
+//     @db.Decimal is Postgres-only and this file must stay valid for both
+//     SQLite (dev) and Postgres (prod), same reasoning as the rest of the
+//     file. Convert to a display amount at the app boundary.
+//
+// Everything else about the dual-provider setup is unchanged from v9:
+// datasource.provider is swapped by scripts/set-db-provider.mjs, driven by
+// DB_PROVIDER — never hand-edit that line directly. StaffRole/SourceType/
+// AssignmentType/correctOption/etc. all stay plain String, validated at the
+// app boundary (zod), not the DB, so the same schema is valid on both
+// targets. The backend console (src/routes/console/**) remains the only
+// place College, Course, CourseCollege, Semester, staff accounts, student
+// course enrollment, and access/payment are created or edited — the REST API
+// (src/routes/api/v1/**) stays read-mostly for academic structure and is
+// where Students/Instructors submit work, study, and view their own
+// eligible content.
+
+datasource db {
+  // Swapped between "postgresql" (prod, Neon) and "sqlite" (dev, Codespace)
+  // by scripts/set-db-provider.mjs — do not edit by hand.
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// StaffRole values:      "ADMIN" | "MODERATOR" | "INSTRUCTOR"
+// SourceType values:     "NOTE" | "ASSIGNMENT" | "ASSIGNMENT_SUBMISSION"
+// AssignmentType values: "INDIVIDUAL" | "GROUP"
+// correctOption/selectedOption values: "A" | "B" | "C" | "D"
+// All validated via zod at the route/action boundary, not the DB, so this
+// works identically on both Postgres and SQLite.
+
+// ================================================================
+// GLOBAL SEMESTER
+// ================================================================
+// The top-level academic container. Admin creates it and manually supplies
+// start/end dates — there is no automatic "next semester" creation from a
+// date rolling over. Exactly one Semester should be isActive; the service
+// layer (not a DB constraint) enforces that when activating a new one, the
+// previous active semester is deactivated in the same transaction.
+//
+// Rollover (Phase 17): when a new semester is activated, the service copies
+// each currently-enrolled student's StudentSemester + StudentCourse rows
+// forward as a new semester's starting point (editable after), and creates
+// fresh, unpaid StudentSemesterAccess/InstructorSemesterAccess rows. Paid
+// status is never copied — that is the one non-negotiable rule here.
+model Semester {
+  id        String   @id @default(cuid())
+  name      String
+  startDate DateTime
+  endDate   DateTime
+  isActive  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  studentSemesters   StudentSemester[]
+  studentCourses     StudentCourse[]
+  instructorCourses  InstructorCourse[]
+  studentAccesses    StudentSemesterAccess[]
+  instructorAccesses InstructorSemesterAccess[]
+  accessPayments     AccessPayment[]
+
+  chapters    CourseChapter[]
+  notes       Note[]
+  assignments Assignment[]
+
+  studySessions StudySession[]
+
+  @@index([isActive])
+  @@index([startDate, endDate])
+}
+
+// ── Colleges & Courses ─────────────────────────────────────
+// Created and edited ONLY from the backend console (Admin/Moderator).
+// Never created or edited through the public REST API — the Frontend app
+// (Instructor or Student) only ever reads this data.
+model College {
+  id               String   @id @default(cuid())
+  name             String
+  createdAt        DateTime @default(now())
+  createdByStaffId String?
+
+  createdBy StaffUser?        @relation("CollegeCreatedBy", fields: [createdByStaffId], references: [id])
+  courses   CourseCollege[]
+  students  Student[]
+  studentSemesters StudentSemester[]
+
+  @@index([createdByStaffId])
+}
+
+// A Course can be shared across multiple Colleges (Math, English, etc. are
+// taken by students in several colleges) — hence the join table rather than
+// a single collegeId on Course. Created ONLY from the backend console.
+// Course itself is not semester-scoped (a course like "Economics" persists
+// across semesters); what's semester-scoped is who's enrolled/assigned/
+// teaching it and what content exists for it in a given semester.
+model Course {
+  id               String   @id @default(cuid())
+  name             String
+  courseCode       String   @unique
+  createdAt        DateTime @default(now())
+  createdByStaffId String?
+
+  createdBy StaffUser? @relation("CourseCreatedBy", fields: [createdByStaffId], references: [id])
+  colleges  CourseCollege[]
+
+  chapters              CourseChapter[]
+  notes                 Note[]
+  assignments           Assignment[]
+  studentCourses        StudentCourse[]
+  instructorAssignments InstructorCourse[]
+  studySessions         StudySession[]
+
+  @@index([createdByStaffId])
+}
+
+model CourseCollege {
+  id        String @id @default(cuid())
+  courseId  String
+  collegeId String
+
+  course  Course  @relation(fields: [courseId], references: [id])
+  college College @relation(fields: [collegeId], references: [id])
+
+  @@unique([courseId, collegeId])
+  @@index([collegeId])
+}
+
+// ── Staff (Admin / Moderator / Instructor) ─────────────────
+// Admin and Moderator have full, unrestricted system-wide access from the
+// backend console (including activating semesters and access/payment).
+// Instructor ("Administrator" in the frontend UI — same account, different
+// label there) is scoped: they can only see/upload content for the specific
+// course(s) they're assigned to for the CURRENT semester, via InstructorCourse
+// — not tied to who uploaded what, since a Moderator might upload on an
+// instructor's behalf and it should still count as theirs. Accounts are
+// created only by an Admin, from the console; no self-signup for staff.
+model StaffUser {
+  id           String    @id @default(cuid())
+  name         String
+  passwordHash String
+  role         String // "ADMIN" | "MODERATOR" | "INSTRUCTOR"
+  createdAt    DateTime  @default(now())
+  deletedAt    DateTime?
+
+  sessions          Session[]
+  instructorCourses InstructorCourse[]
+  collegesCreated   College[]          @relation("CollegeCreatedBy")
+  coursesCreated    Course[]           @relation("CourseCreatedBy")
+
+  uploadedNotes       Note[]       @relation("NoteUploadedBy")
+  publishedNotes      Note[]       @relation("NotePublishedBy")
+  // uploadedAssignments/publishedAssignments REMOVED — Assignment has no
+  // staff-authored upload or publish step anymore (see Assignment's
+  // file-top comment). Staff have read-only access via canManageCourse,
+  // no ownership relation to record here.
+
+  activatedStudentAccesses    StudentSemesterAccess[]    @relation("StudentAccessActivatedBy")
+  activatedInstructorAccesses InstructorSemesterAccess[] @relation("InstructorAccessActivatedBy")
+  instructorSemesterAccesses  InstructorSemesterAccess[] @relation("InstructorSemesterAccessInstructor")
+  instructorPayments          AccessPayment[]            @relation("InstructorPayment")
+  recordedPayments            AccessPayment[]            @relation("PaymentRecordedBy")
+
+  @@index([role])
+}
+
+// Which course(s) an Instructor is assigned to teach, for a given semester —
+// the actual scoping mechanism for that role. Irrelevant for ADMIN/MODERATOR
+// accounts, which aren't restricted by this table. Only Admin/Moderator
+// assigns these, from the console. Semester-scoped so an instructor's
+// historical assignments from a prior semester don't bleed into what they
+// can currently see/upload.
+model InstructorCourse {
+  id           String   @id @default(cuid())
+  instructorId String
+  courseId     String
+  semesterId   String
+  assignedAt   DateTime @default(now())
+
+  instructor StaffUser @relation(fields: [instructorId], references: [id])
+  course     Course    @relation(fields: [courseId], references: [id])
+  semester   Semester  @relation(fields: [semesterId], references: [id])
+
+  @@unique([instructorId, courseId, semesterId])
+  @@index([instructorId, semesterId])
+  @@index([courseId, semesterId])
+}
+
+// One session mechanism serves both entry points: the backend console reads
+// this token from a cookie (same-origin, server-rendered pages talking
+// straight to Prisma); the Frontend's Instructor login reads the same kind
+// of token from an Authorization header (cross-origin, through the REST
+// API, like the student flow). Validation logic is identical either way —
+// only how the token arrives, and which routes it's allowed to hit, differ.
+model Session {
+  id        String   @id // the token itself
+  staffId   String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  staff StaffUser @relation(fields: [staffId], references: [id])
+
+  @@index([staffId])
+  @@index([expiresAt])
+}
+
+// ── Students ────────────────────────────────────────────────
+// A Student still belongs to exactly one College (identity/org context —
+// unchanged). What determines what they can actually see/do is no longer
+// College alone: it's their per-semester enrollment (StudentSemester),
+// their specific courses within that (StudentCourse), and whether they have
+// paid access for the current semester (StudentSemesterAccess). An unpaid
+// student can still authenticate and appear in the console — they just get
+// nothing academic back from the API.
+// Auth: one-time signup (name + studentCode) in the Frontend, fully manual
+// and self-service — no pre-provisioned roster, no bulk import. Login after
+// with the same pair, through the REST API only. Course/semester enrollment
+// is never student-self-service — only Admin/Moderator, from the console.
+model Student {
+  id           String    @id @default(cuid())
+  name         String
+  studentCode  String    @unique
+  passwordHash String
+  collegeId    String
+  createdAt    DateTime  @default(now())
+  deletedAt    DateTime?
+
+  college College @relation(fields: [collegeId], references: [id])
+
+  sessions StudentSession[]
+
+  semesterEnrollments StudentSemester[]
+  courseEnrollments   StudentCourse[]
+  semesterAccesses    StudentSemesterAccess[]
+  payments            AccessPayment[]         @relation("StudentPayment")
+
+  studySessions StudySession[]
+  testAttempts  NoteTestAttempt[]
+  distributionDrillAttempts DistributionDrillAttempt[]
+
+  assignmentsSubmitted Assignment[]       @relation("AssignmentSubmittedBy")
+  assignmentMemberships AssignmentMember[]
+
+  distributionsSent      AssignmentDistribution[]          @relation("DistributionSentBy")
+  distributionsReceived  AssignmentDistributionRecipient[]
+
+  @@index([collegeId])
+}
+
+model StudentSession {
+  id        String   @id // the token itself
+  studentId String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  student Student @relation(fields: [studentId], references: [id])
+
+  @@index([studentId])
+  @@index([expiresAt])
+}
+
+// ── Student semester enrollment ─────────────────────────────
+// "Which semester is this student participating in, and under which
+// college?" One row per (student, semester). College is captured here
+// (rather than only read live off Student.collegeId) so a historical
+// semester's record stays tied to the college context that actually existed
+// then, even if the student's current college later changes.
+// Created by the console — normally at semester rollover (copied forward
+// from the prior semester) or when a brand-new student is first placed into
+// the active semester.
+model StudentSemester {
+  id         String   @id @default(cuid())
+  studentId  String
+  semesterId String
+  collegeId  String
+  createdAt  DateTime @default(now())
+
+  student  Student  @relation(fields: [studentId], references: [id])
+  semester Semester @relation(fields: [semesterId], references: [id])
+  college  College  @relation(fields: [collegeId], references: [id])
+
+  courses StudentCourse[]
+
+  @@unique([studentId, semesterId])
+  @@index([semesterId])
+  @@index([collegeId])
+}
+
+// "Which specific courses is this student taking in this semester?" The
+// authoritative enrollment row content-eligibility is computed from.
+// studentId/semesterId are denormalized onto this row (in addition to
+// studentSemesterId) purely so every downstream query (eligibility checks,
+// analytics) can filter directly without an extra join — the service layer
+// that creates/updates these rows MUST keep studentId/semesterId consistent
+// with the parent StudentSemester's studentId/semesterId transactionally;
+// Prisma cannot express that three-way consistency as a DB constraint.
+// Assigned only by Admin/Moderator from the console — the REST API never
+// lets a student enroll themselves in a course.
+model StudentCourse {
+  id                String   @id @default(cuid())
+  studentSemesterId String
+  studentId         String
+  courseId          String
+  semesterId        String
+  assignedAt        DateTime @default(now())
+
+  studentSemester StudentSemester @relation(fields: [studentSemesterId], references: [id])
+  student         Student         @relation(fields: [studentId], references: [id])
+  course          Course          @relation(fields: [courseId], references: [id])
+  semester        Semester        @relation(fields: [semesterId], references: [id])
+
+  @@unique([studentId, courseId, semesterId])
+  @@index([studentSemesterId])
+  @@index([studentId, semesterId])
+  @@index([courseId, semesterId])
+}
+
+// ── Semester access (paid status) ───────────────────────────
+// Paid access belongs to a semester, not to the person permanently. A
+// student can be PAID for 2025/2026 Second Semester and UNPAID for
+// 2026/2027 First Semester. This is the live/current state; AccessPayment
+// below is the append-only history of how it got there. Activated/revoked
+// only from the console by Admin/Moderator — never by the API.
+model StudentSemesterAccess {
+  id         String @id @default(cuid())
+  studentId  String
+  semesterId String
+
+  isPaid          Boolean   @default(false)
+  amountPaidCents Int?
+  paidAt          DateTime?
+  activatedAt     DateTime?
+  activatedById   String?
+  revokedAt       DateTime?
+  revokedById     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  student     Student    @relation(fields: [studentId], references: [id])
+  semester    Semester   @relation(fields: [semesterId], references: [id])
+  activatedBy StaffUser? @relation("StudentAccessActivatedBy", fields: [activatedById], references: [id])
+
+  @@unique([studentId, semesterId])
+  @@index([semesterId, isPaid])
+  @@index([studentId])
+}
+
+// Same concept as StudentSemesterAccess, for Instructors. An Instructor can
+// retain their account/role while being unable to do anything
+// course-related until access is activated for the current semester.
+model InstructorSemesterAccess {
+  id           String @id @default(cuid())
+  instructorId String
+  semesterId   String
+
+  isPaid          Boolean   @default(false)
+  amountPaidCents Int?
+  paidAt          DateTime?
+  activatedAt     DateTime?
+  activatedById   String?
+  revokedAt       DateTime?
+  revokedById     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  instructor  StaffUser  @relation("InstructorSemesterAccessInstructor", fields: [instructorId], references: [id])
+  semester    Semester   @relation(fields: [semesterId], references: [id])
+  activatedBy StaffUser? @relation("InstructorAccessActivatedBy", fields: [activatedById], references: [id])
+
+  @@unique([instructorId, semesterId])
+  @@index([semesterId, isPaid])
+  @@index([instructorId])
+}
+
+// Lightweight, append-only manual payment record — NOT a payment gateway
+// integration (no Orange Money/Lonestar API, no webhook, no reconciliation).
+// Admin/Moderator enters an amount and turns access on; this row is just the
+// audit trail of that action so activating access a second time (e.g. a
+// student who pays again next semester) doesn't erase the earlier history.
+model AccessPayment {
+  id         String @id @default(cuid())
+  semesterId String
+
+  studentId    String?
+  instructorId String?
+
+  amountCents  Int
+  recordedAt   DateTime @default(now())
+  recordedById String?
+  note         String?
+
+  semester    Semester   @relation(fields: [semesterId], references: [id])
+  student     Student?   @relation("StudentPayment", fields: [studentId], references: [id])
+  instructor  StaffUser? @relation("InstructorPayment", fields: [instructorId], references: [id])
+  recordedBy  StaffUser? @relation("PaymentRecordedBy", fields: [recordedById], references: [id])
+
+  @@index([semesterId])
+  @@index([studentId])
+  @@index([instructorId])
+  @@index([recordedAt])
+}
+
+// ── Course chapters ─────────────────────────────────────────
+// Chapters are now an explicit, semester-scoped academic entity (previously
+// just a free-text chapterLabel on Note). This is what makes chapter-level
+// analytics (most/least studied chapter, time per chapter) possible without
+// string-matching. `order` is the display order set by whoever creates the
+// chapter (Instructor or Admin/Moderator, console-only).
+model CourseChapter {
+  id         String @id @default(cuid())
+  courseId   String
+  semesterId String
+  title      String
+  order      Int
+  createdAt  DateTime @default(now())
+
+  course   Course   @relation(fields: [courseId], references: [id])
+  semester Semester @relation(fields: [semesterId], references: [id])
+
+  notes         Note[]
+  studySessions StudySession[]
+
+  @@unique([courseId, semesterId, order])
+  @@index([courseId, semesterId])
+}
+
+// ── Notes & Assignments ────────────────────────────────────
+// Content can arrive as pasted text OR an uploaded file (PDF/docx). A file
+// is parsed to text synchronously at upload time (cheap, deterministic —
+// not AI) and the result is written into rawText; everything downstream
+// (generation, section-splitting) always reads rawText, never re-parses the
+// file. sourceFileUrl is an opaque string produced by the storage adapter —
+// local disk today, swappable to Cloudflare R2 later with no schema change.
+//
+// uploadedByStaffId is fixed at creation; content is never edited afterward
+// by an Instructor — only Moderator/Admin can correct it from the console.
+// An Instructor who needs a fix re-uploads as a new record.
+//
+// NEW in Phase 10+: Note is semester-scoped (semesterId) and optionally
+// chapter-scoped (chapterId — nullable, a chapter-less note is still valid).
+// Upload/generation and publication are now separate steps: generatedAt
+// marks generation done; publishedAt/publishedByStaffId marks "Save for
+// Students" — the moment eligible (paid + enrolled) students can see it.
+// A generated-but-unpublished note is invisible to every student regardless
+// of eligibility.
+//
+// testStartedAt/testRevealedAt (Phase 9, unchanged) gate the Note's own
+// QuestionUnits acting as that chapter's test — there is no separate Test
+// entity. An Instructor (scoped via the current semester's InstructorCourse,
+// same as everywhere else) sets testStartedAt to open submission, and
+// testRevealedAt to reveal correctOption/explanation plus every student's
+// score at once.
+model Note {
+  id              String    @id @default(cuid())
+  courseId        String
+  semesterId      String
+  chapterId       String?
+  title           String?
+  chapterLabel    String?
+  rawText         String
+  createdAt       DateTime  @default(now())
+  generatedAt     DateTime?
+  generationError String?
+  publishedAt     DateTime?
+  publishedByStaffId String?
+  testStartedAt   DateTime?
+  testRevealedAt  DateTime?
+
+  uploadedByStaffId  String?
+  sourceFileUrl      String?
+  sourceFileName     String?
+  sourceFileMimeType String?
+
+  course   Course         @relation(fields: [courseId], references: [id])
+  semester Semester       @relation(fields: [semesterId], references: [id])
+  chapter  CourseChapter? @relation(fields: [chapterId], references: [id])
+
+  uploadedBy  StaffUser? @relation("NoteUploadedBy", fields: [uploadedByStaffId], references: [id])
+  publishedBy StaffUser? @relation("NotePublishedBy", fields: [publishedByStaffId], references: [id])
+
+  questionUnits QuestionUnit[]
+  studySessions StudySession[]
+  testAttempts  NoteTestAttempt[]
+
+  @@index([courseId, semesterId])
+  @@index([chapterId])
+  @@index([semesterId, publishedAt])
+  @@index([uploadedByStaffId])
+}
+
+// ── Assignments (student-authored homework submissions) ────
+// REDESIGNED — this is not a staff-created "task" that students respond
+// to. Per direct, repeated product clarification: an Assignment in this
+// app IS the homework a student submits — the actual prompt/topic is
+// given verbally/in-class by the instructor, entirely outside this app.
+// "The app is the hub for them to submit. That flow belongs to student."
+// There is no separate staff-authored prompt entity anymore — the
+// previous two-entity model (staff-created `Assignment` + student-created
+// `AssignmentSubmission` pointing at it) collapsed into this single model
+// because nothing should have to pre-exist before a student can submit.
+//
+// Created ENTIRELY by a student: they pick INDIVIDUAL or GROUP themselves
+// at upload time (not set by staff, not fixed in advance), upload their
+// file, and — for GROUP — tag their group members. `submittedBy` is the
+// individual student, or the group head for a GROUP one.
+//
+// Two things happen at creation, same as before: (1) text is extracted
+// from the file for drill generation, (2) a PDF is produced — either the
+// uploaded file passed through unchanged (already a PDF) or rendered from
+// the extracted/pasted text (lib/server/pdfConversion.ts) — the canonical
+// "read this" file for the submitter, the instructor, and Admin/Moderator
+// alike. `pdfConversionError` records a rendering failure without
+// blocking the rest of the upload.
+//
+// Instructor/Admin/Moderator have READ-ONLY access — they see what's been
+// submitted for their course, they never create, edit, generate, or
+// publish an Assignment. There is no publishedAt/publishedByStaffId
+// anymore; visibility to staff is simply "does it exist in my course,"
+// gated the same way as everything else (canManageCourse).
+//
+// Generation (`generatedAt`/`generationError`) and, by extension, the
+// distribute flow, are restricted to GROUP assignments only — see
+// lib/server/access/assignment.ts's canGenerateFromSubmission. An
+// INDIVIDUAL assignment still gets rawText extracted and a pdfUrl
+// rendered, same pipeline, it just has no generate/distribute action —
+// "generate and share is only for a group," a direct product decision,
+// not a technical limitation of the pipeline itself.
+model Assignment {
+  id            String  @id @default(cuid())
+  courseId      String
+  semesterId    String
+  submittedById String
+  type          String // "INDIVIDUAL" | "GROUP" — chosen by the student at upload, immutable after
+  groupName     String?
+  title         String?
+
+  fileUrl      String
+  fileName     String
+  fileMimeType String?
+  rawText      String?
+
+  // The canonical "read this" file — always a real PDF, produced at
+  // upload time. See file-top comment.
+  pdfUrl             String?
+  pdfConversionError String?
+
+  generatedAt     DateTime?
+  generationError String?
+
+  submittedAt DateTime @default(now())
+
+  course      Course   @relation(fields: [courseId], references: [id])
+  semester    Semester @relation(fields: [semesterId], references: [id])
+  submittedBy Student  @relation("AssignmentSubmittedBy", fields: [submittedById], references: [id])
+
+  members       AssignmentMember[]
+  questionUnits QuestionUnit[]
+  distributions AssignmentDistribution[]
+  studySessions StudySession[]
+
+  @@index([courseId, semesterId])
+  @@index([submittedById])
+  @@index([submittedAt])
+  @@index([type])
+}
+
+// The FIRST tagging flow: "these people are in this group." Visible to
+// whoever can manage the course, alongside the assignment. Not the same
+// action as, and has no bearing on, AssignmentDistribution below.
+model AssignmentMember {
+  id           String   @id @default(cuid())
+  assignmentId String
+  studentId    String
+  addedAt      DateTime @default(now())
+
+  assignment Assignment @relation(fields: [assignmentId], references: [id])
+  student    Student    @relation(fields: [studentId], references: [id])
+
+  @@unique([assignmentId, studentId])
+  @@index([studentId])
+}
+
+// The SECOND, unrelated flow: after a GROUP assignment is submitted and
+// study material generated from it, the group head can send that
+// assignment + its generated material to selected classmates —
+// deliberately called "Send to Students," never "tagging." Does NOT
+// auto-broadcast to the whole course on submit; this explicit action is
+// required.
+model AssignmentDistribution {
+  id           String   @id @default(cuid())
+  assignmentId String
+  sentById     String
+  sentAt       DateTime @default(now())
+
+  assignment Assignment @relation(fields: [assignmentId], references: [id])
+  sentBy     Student    @relation("DistributionSentBy", fields: [sentById], references: [id])
+
+  recipients    AssignmentDistributionRecipient[]
+  drillAttempts DistributionDrillAttempt[]
+
+  @@index([assignmentId])
+  @@index([sentById])
+  @@index([sentAt])
+}
+
+// Who actually received a distributed assignment's study material. The
+// API must verify at send time that every recipient is, for the current
+// semester: enrolled in the same course, has paid access, and is active —
+// an unpaid or unenrolled student must not even appear in the sender's
+// selection list, let alone be storable here.
+model AssignmentDistributionRecipient {
+  id             String   @id @default(cuid())
+  distributionId String
+  studentId      String
+  receivedAt     DateTime @default(now())
+
+  distribution AssignmentDistribution @relation(fields: [distributionId], references: [id])
+  student      Student                @relation(fields: [studentId], references: [id])
+
+  @@unique([distributionId, studentId])
+  @@index([studentId])
+}
+
+// ── Generated study materials ──────────────────────────────
+// Written by the same request that calls Groq (synchronous — see
+// generatedAt/generationError above, no job table, unchanged from v9).
+// sourceType tells you which one of noteId/assignmentId is set — exactly
+// one, validated at the app boundary, since Prisma can't express an XOR
+// constraint. Only two source types now — see Assignment's file-top
+// comment: the old three-way NOTE/ASSIGNMENT/ASSIGNMENT_SUBMISSION split
+// collapsed to two once the staff-authored Assignment prompt and the
+// student's submission became the same entity. `order` determines
+// position; chunking (5-per-chunk) is computed at query time.
+model QuestionUnit {
+  id            String  @id @default(cuid())
+  sourceType    String // "NOTE" | "ASSIGNMENT"
+  order         Int
+  question      String
+  optionA       String
+  optionB       String
+  optionC       String
+  optionD       String
+  correctOption String // "A" | "B" | "C" | "D"
+  explanation   String?
+  isTable       Boolean @default(false)
+
+  noteId       String?
+  assignmentId String?
+
+  note       Note?       @relation(fields: [noteId], references: [id])
+  assignment Assignment? @relation(fields: [assignmentId], references: [id])
+
+  dictionaryEntries DictionaryEntry[]
+  testAnswers       NoteTestAnswer[]
+  distributionDrillAnswers DistributionDrillAnswer[]
+
+  @@index([noteId])
+  @@index([assignmentId])
+  @@index([sourceType])
+}
+
+// Each term is linked to the specific QuestionUnit it came from — never a
+// flat glossary. Sent as part of the same bundle as its note/assignment; no
+// separate access control at this level (it inherits the parent's).
+model DictionaryEntry {
+  id             String  @id @default(cuid())
+  term           String
+  definition     String
+  example        String?
+  questionUnitId String
+
+  questionUnit QuestionUnit @relation(fields: [questionUnitId], references: [id])
+
+  @@index([questionUnitId])
+}
+
+// A student's one and only attempt at "the test" for a Note's chapter — see
+// Note.testStartedAt/testRevealedAt for the gating. score is computed at
+// submit time regardless of reveal state; simply not returned to the
+// student by the API until the Note is revealed. One row per
+// (studentId, noteId) — no retakes.
+model NoteTestAttempt {
+  id          String   @id @default(cuid())
+  studentId   String
+  noteId      String
+  submittedAt DateTime @default(now())
+  score       Int
+
+  student Student          @relation(fields: [studentId], references: [id])
+  note    Note             @relation(fields: [noteId], references: [id])
+  answers NoteTestAnswer[]
+
+  @@unique([studentId, noteId])
+  @@index([studentId])
+  @@index([noteId])
+}
+
+model NoteTestAnswer {
+  id             String  @id @default(cuid())
+  attemptId      String
+  questionUnitId String
+  selectedOption String // "A" | "B" | "C" | "D"
+  isCorrect      Boolean
+
+  attempt      NoteTestAttempt @relation(fields: [attemptId], references: [id])
+  questionUnit QuestionUnit    @relation(fields: [questionUnitId], references: [id])
+
+  @@index([attemptId])
+  @@index([questionUnitId])
+}
+
+// ── Study activity (full analytics, not just "opened") ─────
+// An append-only event log, one row per study session — the source of the
+// numbers behind every analytics dashboard (student/instructor/admin):
+// total time per note/course, weekly patterns, engaged/at-risk status —
+// all computed from these rows, never a stored running total.
+//
+// REDESIGNED THREE TIMES total across this build — this is the final,
+// reconciled version, confirmed against the actual Frontend implementation
+// (BACKEND_HANDOFF(2).md), not a fourth guess:
+//   1. Original: single-shot "log a completed duration," client-reported,
+//      untrusted server-side re-derivation attempted.
+//   2. Real-time Start/End Study: server times the gap itself
+//      (`POST /study-sessions/start` → `.../​:id/end`), fully trusted
+//      because the server, not the client, measures durationSeconds.
+//   3. (Considered, NOT what shipped) A batch "sync accumulated activity"
+//      redesign — built once, then reverted after confirming the Frontend
+//      actually kept #2's start/end pair for the online case, just called
+//      it in short bursts that approximate activity-based tracking (each
+//      pause is a real `end`, each resume is a real new `start`) — see
+//      lib/server/access/... the online path needed no backend change at
+//      all once that was clarified.
+//   4. What #2 couldn't cover: a student who goes offline mid-session.
+//      `start`/`end` are real-time-correlated by design (the server times
+//      the gap) — there is no "start a session against a server that
+//      isn't reachable." For that case only, the Frontend accumulates
+//      active-seconds locally while offline and reports the total
+//      after the fact via `POST /study-sessions/backfill`, once
+//      connectivity returns — this is the one place durationSeconds is
+//      genuinely client-computed rather than server-timed, an accepted,
+//      unavoidable tradeoff for an inherently-offline scenario, not an
+//      oversight. See lib/server/analytics/studySessionBackfill.ts's
+//      clamping for what guards against it.
+//
+// NOTES ONLY. Per direct product decision, Assignments are read as PDF
+// (see Assignment/AssignmentSubmission's `pdfUrl`) and don't get this kind
+// of engagement tracking the way a Note's chapter content does.
+// `assignmentId`/`assignmentSubmissionId` remain in the schema (nullable)
+// purely because historical rows from an earlier era may still reference
+// them — nothing new writes to these two columns anymore.
+//
+// semesterId + courseId are stored directly (not just derivable through
+// note) specifically so analytics queries don't need deep joins for every
+// dashboard — this is the single most heavily queried table in the
+// system. chapterId is optional (a chapter-less note is valid). endedAt is
+// nullable — null means a Start/End session currently in progress
+// (durationSeconds is 0 until it's ended); a backfilled entry is always
+// created already-complete, both fields set at once.
+model StudySession {
+  id         String @id @default(cuid())
+  studentId  String
+  semesterId String
+  courseId   String
+  chapterId  String?
+
+  noteId       String?
+  assignmentId String? // legacy only — see model comment; nothing new writes this
+
+  startedAt       DateTime  @default(now())
+  endedAt         DateTime?
+  durationSeconds Int
+
+  student  Student       @relation(fields: [studentId], references: [id])
+  semester Semester      @relation(fields: [semesterId], references: [id])
+  course   Course        @relation(fields: [courseId], references: [id])
+  chapter  CourseChapter? @relation(fields: [chapterId], references: [id])
+
+  note       Note?       @relation(fields: [noteId], references: [id])
+  assignment Assignment? @relation(fields: [assignmentId], references: [id])
+
+  @@index([studentId, semesterId])
+  @@index([courseId, semesterId])
+  @@index([chapterId])
+  @@index([noteId])
+  @@index([assignmentId])
+  @@index([startedAt])
+}
+
+// ── Distribution drill attempts (Phase 16 gating, added post-launch) ──
+// The gated counterpart to a student's own generate-and-drill flow (see
+// Assignment.generatedAt — a GROUP assignment's own submitter gets an
+// ungated response from POST /submissions/:id/generate directly), for
+// content a student received via distribution instead. Added
+// because GET /students/me/received-distributions originally sent
+// correctOption/explanation fully revealed with no gating at all — a
+// deliberate, temporary tradeoff to ship the right look before the real
+// mechanism existed (see BACKEND_HANDOFF(2).md §2.3). Repeatable,
+// self-paced, no staff involvement, reveal tracks only the student's MOST
+// RECENT attempt on that distribution.
+model DistributionDrillAttempt {
+  id             String    @id @default(cuid())
+  studentId      String
+  distributionId String
+  startedAt      DateTime  @default(now())
+  finishedAt     DateTime?
+  score          Int?
+
+  student      Student                @relation(fields: [studentId], references: [id])
+  distribution AssignmentDistribution @relation(fields: [distributionId], references: [id])
+  answers      DistributionDrillAnswer[]
+
+  @@index([studentId])
+  @@index([distributionId])
+}
+
+model DistributionDrillAnswer {
+  id             String  @id @default(cuid())
+  attemptId      String
+  questionUnitId String
+  selectedOption String // "A" | "B" | "C" | "D"
+  isCorrect      Boolean
+
+  attempt      DistributionDrillAttempt @relation(fields: [attemptId], references: [id])
+  questionUnit QuestionUnit             @relation(fields: [questionUnitId], references: [id])
+
+  @@index([attemptId])
+  @@index([questionUnitId])
+}
