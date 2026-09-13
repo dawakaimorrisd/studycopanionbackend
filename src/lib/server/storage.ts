@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { env } from '$env/dynamic/private';
 
 export interface StoredFile {
 	buffer: Buffer;
@@ -106,10 +105,9 @@ class CloudinaryStorage implements FileStorage {
 	constructor() {
 		const { v2: cloudinary } = require('cloudinary') as typeof import('cloudinary');
 
-		const cloudName = env.CLOUDINARY_CLOUD_NAME;
-		const apiKey = env.CLOUDINARY_API_KEY;
-		const apiSecret = env.CLOUDINARY_API_SECRET;
-
+		const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+const apiKey = process.env.CLOUDINARY_API_KEY;
+const apiSecret = process.env.CLOUDINARY_API_SECRET;
 		if (!cloudName || !apiKey || !apiSecret) {
 			throw new Error(
 				'Cloudinary storage is enabled, but CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, or CLOUDINARY_API_SECRET is missing.'
@@ -167,7 +165,7 @@ class CloudinaryStorage implements FileStorage {
 }
 
 function createStorage(): FileStorage {
-	const provider = env.STORAGE_PROVIDER?.toLowerCase();
+	const provider = process.env.STORAGE_PROVIDER?.toLowerCase();
 
 	if (provider === 'cloudinary') {
 		return new CloudinaryStorage();

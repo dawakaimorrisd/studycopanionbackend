@@ -1,7 +1,8 @@
+
 import { error, fail } from '@sveltejs/kit';
 import { db } from '$lib/server/db';
 import { requireAdminOrModerator } from '$lib/server/auth/permissions';
-import { runGeneration } from '$lib/server/generation/generate';
+import { enqueueNoteGeneration } from '$lib/server/jobs/queue';
 import { config } from '$lib/server/env';
 import { eligibleStudentsForCourse } from '$lib/server/access/course';
 import type { Actions, PageServerLoad } from './$types';
@@ -22,43 +23,75 @@ export const load: PageServerLoad = async ({ locals, params }) => {
 			chapter: { select: { id: true, title: true } },
 			uploadedBy: { select: { name: true, role: true } },
 			publishedBy: { select: { name: true } },
-			questionUnits: { orderBy: { order: 'asc' }, include: { dictionaryEntries: true } },
-			testAttempts: { select: { id: true, studentId: true, score: true } }
+			questionUnits: {
+				orderBy: { order: 'asc' },
+				include: { dictionaryEntries: true }
+			},
+			testAttempts: {
+				select: {
+					id: true,
+					studentId: true,
+					score: true
+				}
+			}
 		}
 	});
 
 	if (!note) throw error(404, 'Note not found.');
 
 	const chapters = await db.courseChapter.findMany({
-		where: { courseId: note.courseId, semesterId: note.semesterId },
+		where: {
+			courseId: note.courseId,
+			semesterId: note.semesterId
+		},
 		orderBy: { order: 'asc' },
-		select: { id: true, title: true }
+		select: {
+			id: true,
+			title: true
+		}
 	});
 
 	// Phase 10+: this used to render note.grantedTo (NoteAccess grant rows —
 	// removed). Every paid + enrolled student in this note's course/semester
 	// is now automatically eligible once the note is published; this list is
 	// what "Save for Students" makes visible, not something staff picks.
-	const eligibleStudents = await eligibleStudentsForCourse(note.courseId, note.semesterId);
+	const eligibleStudents = await eligibleStudentsForCourse(
+		note.courseId,
+		note.semesterId
+	);
 
-	return { note, chapters, eligibleStudents, groqKeyOptions: config.groqApiKeyOptions.map((o) => o.label) };
+	return {
+		note,
+		chapters,
+		eligibleStudents,
+		groqKeyOptions: config.groqApiKeyOptions.map((o) => o.label)
+	};
 };
 
 export const actions: Actions = {
 	generate: async ({ request, locals, params }) => {
 		requireAdminOrModerator(locals.staff);
 
-		// An optional Groq key picker — see generate.ts's forceGroqKeyLabel.
-		// Empty/unset means the default/first-configured key.
+		// An optional Groq key picker.
+		// Only the safe key label is placed into the Redis job.
+		// The actual API key remains server-side.
 		const formData = await request.formData();
 		const groqKey = String(formData.get('groqKey') ?? '').trim();
 
-		// Synchronous, per the plan — this request blocks until the chosen
-		// provider(s) return. runGeneration never throws; failures land in
-		// Note.generationError, which the page below renders.
-		await runGeneration('NOTE', params.id, groqKey ? { forceGroqKeyLabel: groqKey } : {});
+		// Queue generation in Redis instead of running Groq synchronously.
+		// The background worker will call runGeneration('NOTE', ...)
+		// using the selected key label.
+		await enqueueNoteGeneration(
+			params.id,
+			groqKey || undefined
+		);
 
-		return { generated: true };
+		// 202-style queued result. The page can refresh/poll the note
+		// and see generatedAt/generationError once the worker finishes.
+		return {
+			generated: false,
+			queued: true
+		};
 	},
 
 	// v9 amendment: some uploads come through with messy extracted text
@@ -74,13 +107,19 @@ export const actions: Actions = {
 		requireAdminOrModerator(locals.staff);
 		const formData = await request.formData();
 		const rawText = String(formData.get('rawText') ?? '');
+
 		if (!rawText.trim()) {
 			return fail(400, { error: 'Content cannot be empty.' });
 		}
 
-		await db.note.update({ where: { id: params.id }, data: { rawText } });
+		await db.note.update({
+			where: { id: params.id },
+			data: { rawText }
+		});
+
 		return { textEdited: true };
 	},
+
 	// v9 amendment: not every Instructor will have the time or inclination
 	// to run the pre-test cycle themselves for every chapter — the dean's
 	// own reasoning was that a chapter without a pre-test run at all would
@@ -95,41 +134,67 @@ export const actions: Actions = {
 	// API internally).
 	startTest: async ({ locals, params }) => {
 		requireAdminOrModerator(locals.staff);
+
 		await db.note.updateMany({
-			where: { id: params.id, testStartedAt: null },
-			data: { testStartedAt: new Date() }
+			where: {
+				id: params.id,
+				testStartedAt: null
+			},
+			data: {
+				testStartedAt: new Date()
+			}
 		});
+
 		return { testStarted: true };
 	},
 
 	endTest: async ({ locals, params }) => {
 		requireAdminOrModerator(locals.staff);
 
-		const note = await db.note.findUnique({ where: { id: params.id }, select: { testStartedAt: true } });
+		const note = await db.note.findUnique({
+			where: { id: params.id },
+			select: { testStartedAt: true }
+		});
+
 		if (!note?.testStartedAt) {
-			return fail(400, { error: "This chapter's pre-test hasn't been started yet." });
+			return fail(400, {
+				error: "This chapter's pre-test hasn't been started yet."
+			});
 		}
 
 		await db.note.updateMany({
-			where: { id: params.id, testRevealedAt: null },
-			data: { testRevealedAt: new Date() }
+			where: {
+				id: params.id,
+				testRevealedAt: null
+			},
+			data: {
+				testRevealedAt: new Date()
+			}
 		});
+
 		return { testEnded: true };
 	},
 
 	// The override: skip the whole start → students take it → end cycle and
 	// just show every sent student the questions AND answers directly, as
-	// pure study material. This needs no new field or gating logic — the
-	// existing GET /notes/:id behavior already does exactly this the moment
-	// BOTH timestamps are set, whether or not any NoteTestAttempt exists.
-	// Setting both at once here in a single click is the entire feature.
+	// pure study material. This needs no new field or gating logic —
+	// the existing GET /notes/:id behavior already does exactly this the
+	// moment BOTH timestamps are set, whether or not any NoteTestAttempt
+	// exists. Setting both at once here in a single click is the entire
+	// feature.
 	overrideReveal: async ({ locals, params }) => {
 		requireAdminOrModerator(locals.staff);
+
 		const now = new Date();
+
 		await db.note.update({
 			where: { id: params.id },
-			data: { testStartedAt: now, testRevealedAt: now }
+			data: {
+				testStartedAt: now,
+				testRevealedAt: now
+			}
 		});
+
 		return { overridden: true };
 	},
 
@@ -143,24 +208,39 @@ export const actions: Actions = {
 	publish: async ({ locals, params }) => {
 		const staff = requireAdminOrModerator(locals.staff);
 
-		const note = await db.note.findUnique({ where: { id: params.id }, select: { generatedAt: true } });
+		const note = await db.note.findUnique({
+			where: { id: params.id },
+			select: { generatedAt: true }
+		});
+
 		if (!note?.generatedAt) {
-			return fail(400, { error: 'Generate this note before saving it for students.' });
+			return fail(400, {
+				error: 'Generate this note before saving it for students.'
+			});
 		}
 
 		await db.note.update({
 			where: { id: params.id },
-			data: { publishedAt: new Date(), publishedByStaffId: staff.id }
+			data: {
+				publishedAt: new Date(),
+				publishedByStaffId: staff.id
+			}
 		});
+
 		return { published: true };
 	},
 
 	unpublish: async ({ locals, params }) => {
 		requireAdminOrModerator(locals.staff);
+
 		await db.note.update({
 			where: { id: params.id },
-			data: { publishedAt: null, publishedByStaffId: null }
+			data: {
+				publishedAt: null,
+				publishedByStaffId: null
+			}
 		});
+
 		return { unpublished: true };
 	},
 
@@ -168,13 +248,18 @@ export const actions: Actions = {
 	// chapter-less note is valid — see schema.prisma's nullable chapterId).
 	setChapter: async ({ request, locals, params }) => {
 		requireAdminOrModerator(locals.staff);
+
 		const formData = await request.formData();
 		const chapterId = String(formData.get('chapterId') ?? '');
 
 		await db.note.update({
 			where: { id: params.id },
-			data: { chapterId: chapterId || null }
+			data: {
+				chapterId: chapterId || null
+			}
 		});
+
 		return { chapterSet: true };
 	}
 };
+

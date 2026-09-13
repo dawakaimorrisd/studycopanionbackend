@@ -598,6 +598,8 @@ model Note {
 // rendered, same pipeline, it just has no generate/distribute action —
 // "generate and share is only for a group," a direct product decision,
 // not a technical limitation of the pipeline itself.
+
+
 model Assignment {
   id            String  @id @default(cuid())
   courseId      String
@@ -605,6 +607,7 @@ model Assignment {
   submittedById String
   type          String // "INDIVIDUAL" | "GROUP" — chosen by the student at upload, immutable after
   groupName     String?
+  processingStatus String @default("PROCESSING")
   title         String?
 
   fileUrl      String

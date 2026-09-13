@@ -1,4 +1,3 @@
-
 // The whole generation pipeline, run synchronously inline in a console form
 // action (see build plan §6/Phase 4 — no job table, no worker).
 //
@@ -19,7 +18,8 @@ import { buildGenerationPrompt, buildRetryPrompt } from './prompt';
 import { callGroq } from './providers/groq';
 import { parseGenerationResponse } from './parseAndValidate';
 import { logger } from '$lib/server/logger';
-import { config } from '$lib/server/env';
+
+import type { GenerationConfig } from '$lib/server/config';
 import type { GenerationResponse } from './schema';
 
 export type GenerationSourceType = 'NOTE' | 'ASSIGNMENT';
@@ -62,10 +62,6 @@ async function callWithRetry(
 
 /**
  * Store a generation failure against the original Note or Assignment.
- * Assignment here is the unified, student-authored model (see
- * schema.prisma) — a GROUP assignment's own submitter generating drills
- * from their own submitted work reuses this exact pipeline, same fields,
- * no longer a third, separate source type.
  */
 async function writeGenerationError(
 	sourceType: GenerationSourceType,
@@ -96,12 +92,6 @@ async function writeGenerationResult(
 	id: string,
 	result: GenerationResponse
 ): Promise<void> {
-	// Quality signal, not a validation gate.
-	//
-	// Explanation and dictionary entries are legitimately optional on
-	// individual question units, so low content density does not cause
-	// generation to fail. It is logged because consistently low rates can
-	// indicate that the model is under-delivering relative to the prompt.
 	const total = result.questionUnits.length;
 
 	const withExplanation = result.questionUnits.filter(
@@ -126,7 +116,6 @@ async function writeGenerationResult(
 	}
 
 	await db.$transaction(async (tx: Prisma.TransactionClient) => {
-		// Remove the previous generation before writing the new one.
 		if (sourceType === 'NOTE') {
 			await tx.questionUnit.deleteMany({
 				where: { noteId: id }
@@ -137,7 +126,6 @@ async function writeGenerationResult(
 			});
 		}
 
-		// Write every generated question unit and its dictionary entries.
 		for (let i = 0; i < result.questionUnits.length; i++) {
 			const qu = result.questionUnits[i];
 
@@ -170,8 +158,6 @@ async function writeGenerationResult(
 			});
 		}
 
-		// Mark the source record as successfully generated and clear any
-		// previous generation error.
 		if (sourceType === 'NOTE') {
 			await tx.note.update({
 				where: { id },
@@ -199,14 +185,26 @@ async function writeGenerationResult(
  *   - omitted → use the first configured Groq key
  *   - supplied → use the specifically selected Groq key
  *
+ * `configOverride`:
+ *   - omitted → use the normal SvelteKit application config
+ *   - supplied → use an alternative runtime config, such as the
+ *     standalone worker's process.env-based config
+ *
  * The function never throws generation errors to the caller.
  * Failures are written to `generationError`.
  */
 export async function runGeneration(
 	sourceType: GenerationSourceType,
 	id: string,
-	options: { forceGroqKeyLabel?: string } = {}
+	options: {
+		forceGroqKeyLabel?: string;
+		configOverride?: GenerationConfig;
+	} = {}
 ): Promise<void> {
+	const runtimeConfig =
+	options.configOverride ??
+	(await import('$lib/server/env')).config;
+
 	const keyLabel = options.forceGroqKeyLabel;
 
 	logger.info('generation_started', {
@@ -217,10 +215,21 @@ export async function runGeneration(
 
 	// Retrieve the source content.
 	let rawText: string | null | undefined;
+
 	if (sourceType === 'NOTE') {
-		rawText = (await db.note.findUnique({ where: { id }, select: { rawText: true } }))?.rawText;
+		rawText = (
+			await db.note.findUnique({
+				where: { id },
+				select: { rawText: true }
+			})
+		)?.rawText;
 	} else {
-		rawText = (await db.assignment.findUnique({ where: { id }, select: { rawText: true } }))?.rawText;
+		rawText = (
+			await db.assignment.findUnique({
+				where: { id },
+				select: { rawText: true }
+			})
+		)?.rawText;
 	}
 
 	// Nothing to generate from.
@@ -245,15 +254,19 @@ export async function runGeneration(
 		// If staff explicitly selected a key, use that key.
 		// Otherwise use the first configured Groq key.
 		const apiKey = keyLabel
-			? config.getGroqApiKeyByLabel(keyLabel)
-			: config.requiredGroqApiKey;
+			? runtimeConfig.getGroqApiKeyByLabel(keyLabel)
+			: runtimeConfig.requiredGroqApiKey;
 
 		const providerLabel = keyLabel
 			? `Groq (${keyLabel})`
 			: 'Groq';
 
 		result = await callWithRetry(
-			(promptToSend) => callGroq(promptToSend, apiKey),
+			(promptToSend) => callGroq(
+	promptToSend,
+	apiKey,
+	runtimeConfig.groqModel
+),
 			prompt,
 			providerLabel
 		);
@@ -283,4 +296,3 @@ export async function runGeneration(
 		questionUnitCount: result.questionUnits.length
 	});
 }
-
